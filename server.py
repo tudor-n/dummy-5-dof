@@ -6,7 +6,7 @@
    python server.py --port COM5 --camera 1 / --no-camera
    Voice tab (hearing.py): pip install faster-whisper nvidia-cublas-cu12
 """
-import argparse, asyncio, collections, copy, json, math, random, sys, time
+import argparse, asyncio, collections, copy, json, math, random, re, sys, threading, time
 from pathlib import Path
 from aiohttp import web, WSMsgType
 import gestures
@@ -854,6 +854,7 @@ async def reconnect_loop():
                 ser, pose = await asyncio.get_running_loop().run_in_executor(None, connect_serial, S.port)
             except Exception:
                 continue
+            if ser is None: continue        # opened, but the firmware never answered GET: try again
             S.ser = ser; push_limits()
             if pose and len(pose) == 6:
                 S.cur = pose; S.tgt = list(pose); S.live = False
@@ -1738,18 +1739,60 @@ async def vocab(req):
     # word list for the in-app detect keyboard; editable as "vocab" in vision.json
     return web.json_response({"vocab": V.vocab if V is not None else []}, headers=NOCACHE)
 
-def connect_serial(port):
-    ser = serial.Serial(port, 115200, timeout=0.2)
-    time.sleep(2.5); ser.reset_input_buffer()
-    for _ in range(5):
-        ser.write(b"GET\n"); t0 = time.time()
-        while time.time() - t0 < 0.6:
-            line = ser.readline().decode(errors="ignore").strip()
-            if line.startswith("S "):
-                tok = line[2:].split()
-                S.engaged = len(tok) > 6 and tok[6] == "E1"
-                return ser, [float(v) for v in tok[:6]]
-    return ser, None
+# "S a0 .. a5 E0|E1" from the firmware, newline-terminated (a cut-off line must not parse as a short angle)
+STATE_RE = re.compile(rb"S (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?) "
+                      rb"(-?\d+(?:\.\d+)?) (-?\d+(?:\.\d+)?)(?: E([01]))?\r?\n")
+HANDSHAKE_S = 10.0   # how long a freshly opened port gets to answer GET (it resets the ESP32, which then boots)
+
+def parse_state(buf):
+    """The last complete state reply anywhere in buf, as (pose, engaged), or None.
+    Anything around it (boot banner, watchdog lines, junk on a just-opened port) is skipped."""
+    m = None
+    for m in STATE_RE.finditer(buf): pass
+    if m is None: return None
+    return [float(g) for g in m.groups()[:6]], m.group(7) == b"1"
+
+def connect_serial(port, wait=HANDSHAKE_S):
+    """Open the port and wait until the firmware answers GET. Returns (ser, pose), or (None, None)
+    when it never answers: the caller then treats the link as lost and retries, rather than driving
+    an arm it can't hear on a guessed pose.
+    No fixed sleep: opening the port resets the ESP32, and for the first seconds the line can carry
+    megabytes of junk with the reply buried in it, so GET is resent and everything read is searched."""
+    ser = serial.Serial(port, 115200, timeout=0.1)
+    t0 = time.time(); buf = b""; next_get = t0 + 0.3
+    while time.time() - t0 < wait:
+        if time.time() >= next_get:
+            ser.write(b"GET\n"); next_get = time.time() + 0.5
+        buf = (buf + ser.read(4096))[-4096:]
+        st = parse_state(buf)
+        if st:
+            S.engaged = st[1]
+            start_reader(ser)
+            return ser, st[0]
+    try: ser.close()
+    except Exception: pass
+    return None, None
+
+def start_reader(ser):
+    """Keep reading the port for as long as it is open. Nothing else reads it after the handshake;
+    this keeps the input from backing up, and puts anything that isn't a state reply (a firmware
+    watchdog report, a reset banner) in the log, at most once a minute.
+    It has to stay cheap: some USB-serial adapters re-deliver the last bytes they got over and over,
+    hundreds of KB/s (far more than 115200 baud can carry), so between log lines a chunk is dropped
+    unread."""
+    def run():
+        last = 0.0
+        while True:
+            try: chunk = ser.read(65536)
+            except Exception: return            # closed or unplugged: serial_send handles the loss
+            if not chunk or time.time() - last < 60: continue
+            for ln in chunk.split(b"\n")[1:-1]:  # whole lines only: the ends may be cut
+                txt = ln.decode(errors="replace").strip()
+                if len(txt) > 3 and not txt.startswith("S ") and not txt.startswith("E0") and not txt.startswith("E1"):
+                    last = time.time()
+                    log(f"ESP32 says: {txt[:160]}" + (" - reflash the firmware (./flash.sh)" if "task_wdt" in txt else ""), "warn")
+                    break
+    threading.Thread(target=run, name="serial-reader", daemon=True).start()
 
 def main():
     global V
@@ -1774,8 +1817,8 @@ def main():
         try: S.ser, pose = connect_serial(port)
         except serial.SerialException as e:
             raise SystemExit(f"\nCannot open {port}: {e}\n-> Another program is probably using it (idf monitor, another server.py, serial monitor).\n   Close it, or unplug/replug the ESP32's USB, then try again.")
-        if pose and len(pose) == 6: S.cur = pose; S.tgt = list(pose); print("Arm reports pose:", pose); push_limits()
-        else: print("WARNING: ESP32 didn't answer GET - is the new firmware flashed? Assuming start pose.")
+        if S.ser is not None: S.cur = pose; S.tgt = list(pose); print("Arm reports pose:", pose); push_limits()
+        else: print(f"WARNING: {port} opened but the ESP32 didn't answer GET within {HANDSHAKE_S:.0f} s - retrying in the background (the arm shows as lost until it answers)")
     if not a.no_camera:
         try:
             from vision import Vision, find_camera

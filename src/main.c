@@ -119,7 +119,10 @@ void app_main(void) {
     
     while (1) {
         // Read incoming serial commands
-        int n = uart_read_bytes(UART_NUM_0, rx, sizeof(rx), pdMS_TO_TICKS(5));
+        // Wait at least one tick: at CONFIG_FREERTOS_HZ=100, pdMS_TO_TICKS(5) is 0, so the loop never
+        // blocked, IDLE0 never ran, and the task watchdog printed a report and a backtrace onto this
+        // same UART every 5 s, burying the replies to GET. One tick is 10 ms, well inside the 20 ms servo loop.
+        int n = uart_read_bytes(UART_NUM_0, rx, sizeof(rx), 1);
         for (int i = 0; i < n; i++) {
             char c = (char)rx[i];
             if (c == '\n' || c == '\r') { if (len) { line[len] = 0; handle_line(line); len = 0; } }
