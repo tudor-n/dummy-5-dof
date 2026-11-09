@@ -1776,21 +1776,22 @@ def connect_serial(port, wait=HANDSHAKE_S):
 def start_reader(ser):
     """Keep reading the port for as long as it is open. Nothing else reads it after the handshake;
     this keeps the input from backing up, and puts anything that isn't a state reply (a firmware
-    watchdog report, a reset banner) in the log, at most once a minute."""
+    watchdog report, a reset banner) in the log, at most once a minute.
+    It has to stay cheap: some USB-serial adapters re-deliver the last bytes they got over and over,
+    hundreds of KB/s (far more than 115200 baud can carry), so between log lines a chunk is dropped
+    unread."""
     def run():
-        buf = b""; last = 0.0
+        last = 0.0
         while True:
-            try: chunk = ser.read(4096)
+            try: chunk = ser.read(65536)
             except Exception: return            # closed or unplugged: serial_send handles the loss
-            if not chunk: continue
-            buf += chunk
-            *lines, buf = buf.split(b"\n"); buf = buf[-512:]
-            for ln in lines:
+            if not chunk or time.time() - last < 60: continue
+            for ln in chunk.split(b"\n")[1:-1]:  # whole lines only: the ends may be cut
                 txt = ln.decode(errors="replace").strip()
-                if not txt or txt.startswith("S "): continue
-                if time.time() - last > 60:
+                if len(txt) > 3 and not txt.startswith("S ") and not txt.startswith("E0") and not txt.startswith("E1"):
                     last = time.time()
-                    log(f"ESP32 says: {txt[:160]}" + (" - reflash the firmware (src/main.c)" if "task_wdt" in txt else ""), "warn")
+                    log(f"ESP32 says: {txt[:160]}" + (" - reflash the firmware (./flash.sh)" if "task_wdt" in txt else ""), "warn")
+                    break
     threading.Thread(target=run, name="serial-reader", daemon=True).start()
 
 def main():
